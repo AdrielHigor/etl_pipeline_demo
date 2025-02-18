@@ -1,0 +1,240 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ETL Pipeline for Recipe Processing
+Resources:
+  LambdaCodeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: lambda-code-bucket
+      AccessControl: Private
+      VersioningConfiguration:
+        Status: Enabled
+    Metadata:
+      SamResourceId: LambdaCodeBucket
+  RawRecipesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: raw-recipes-data
+      AccessControl: Private
+    Metadata:
+      SamResourceId: RawRecipesBucket
+  TempRecipesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: temp-recipes-bucket
+      AccessControl: Private
+    Metadata:
+      SamResourceId: TempRecipesBucket
+  FailedRecipesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: failed-recipes-bucket
+      AccessControl: Private
+    Metadata:
+      SamResourceId: FailedRecipesBucket
+  ProcessedRecipesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: processed-recipes-bucket
+      AccessControl: Private
+    Metadata:
+      SamResourceId: ProcessedRecipesBucket
+  RecipeProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: recipe-processing-queue
+      VisibilityTimeout: 300
+    Metadata:
+      SamResourceId: RecipeProcessingQueue
+  DataExtractionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: data-extraction-lambda
+      Handler: data_extraction.lambda_handler
+      Runtime: python3.9
+      Code:
+        S3Bucket:
+          Ref: LambdaCodeBucket
+        S3Key: data_extraction.zip
+      Role:
+        Fn::GetAtt:
+        - LambdaExecutionRole
+        - Arn
+      Environment:
+        Variables:
+          TEMP_BUCKET:
+            Ref: TempRecipesBucket
+          FAILED_BUCKET:
+            Ref: FailedRecipesBucket
+          PROCESSING_QUEUE_URL:
+            Ref: RecipeProcessingQueue
+          BATCH_SIZE: 100
+          MAX_WORKERS: 10
+      Timeout: 300
+    Metadata:
+      SamResourceId: DataExtractionLambda
+  DataTransformationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: data-transformation-lambda
+      Handler: data_transformation.lambda_handler
+      Runtime: python3.9
+      Code:
+        S3Bucket:
+          Ref: LambdaCodeBucket
+        S3Key: data_transformation.zip
+      Role:
+        Fn::GetAtt:
+        - LambdaExecutionRole
+        - Arn
+      Environment:
+        Variables:
+          PROCESSED_BUCKET:
+            Ref: ProcessedRecipesBucket
+      Timeout: 300
+    Metadata:
+      SamResourceId: DataTransformationLambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: LambdaExecutionPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:*
+            - sqs:*
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+    Metadata:
+      SamResourceId: LambdaExecutionRole
+  RawBucketTrigger:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Fn::GetAtt:
+        - DataExtractionLambda
+        - Arn
+      Principal: s3.amazonaws.com
+      SourceArn:
+        Fn::GetAtt:
+        - RawRecipesBucket
+        - Arn
+    Metadata:
+      SamResourceId: RawBucketTrigger
+  QueueTrigger:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Fn::GetAtt:
+        - DataTransformationLambda
+        - Arn
+      Principal: sqs.amazonaws.com
+      SourceArn:
+        Fn::GetAtt:
+        - RecipeProcessingQueue
+        - Arn
+    Metadata:
+      SamResourceId: QueueTrigger
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: glue.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: GlueCrawlerPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:ListBucket
+            Resource:
+            - Fn::GetAtt:
+              - ProcessedRecipesBucket
+              - Arn
+            - Fn::Sub: ${ProcessedRecipesBucket.Arn}/*
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+    Metadata:
+      SamResourceId: GlueCrawlerRole
+  RecipeCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: recipe-data-crawler
+      Role:
+        Fn::GetAtt:
+        - GlueCrawlerRole
+        - Arn
+      DatabaseName: recipes_db
+      Description: Crawler for processed recipe data
+      Targets:
+        S3Targets:
+        - Path:
+            Fn::Sub: s3://${ProcessedRecipesBucket}/
+      TablePrefix: processed_
+      Schedule:
+        ScheduleExpression: cron(0 0 * * ? *)
+      Configuration: "{\n  \"Version\": 1.0,\n  \"CrawlerOutput\": {\n    \"Partitions\"\
+        : {\n      \"AddOrUpdateBehavior\": \"InheritFromTable\"\n    }\n  }\n}\n"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_EVERYTHING
+    Metadata:
+      SamResourceId: RecipeCrawler
+Outputs:
+  RawRecipesBucketName:
+    Description: Name of the raw recipes bucket
+    Value:
+      Ref: RawRecipesBucket
+  ProcessedRecipesBucketName:
+    Description: Name of the processed recipes bucket
+    Value:
+      Ref: ProcessedRecipesBucket
+  DataExtractionLambdaArn:
+    Description: ARN of the Data Extraction Lambda
+    Value:
+      Fn::GetAtt:
+      - DataExtractionLambda
+      - Arn
+  DataTransformationLambdaArn:
+    Description: ARN of the Data Transformation Lambda
+    Value:
+      Fn::GetAtt:
+      - DataTransformationLambda
+      - Arn
+  LambdaCodeBucketName:
+    Description: Name of the Lambda code bucket
+    Value:
+      Ref: LambdaCodeBucket
+  GlueCrawlerName:
+    Description: Name of the Glue Crawler
+    Value:
+      Ref: RecipeCrawler
+  GlueDatabaseName:
+    Description: Name of the Glue Database
+    Value: recipes_db

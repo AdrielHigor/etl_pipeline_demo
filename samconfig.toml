@@ -1,0 +1,14 @@
+version = 0.1
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "recipe-processing-stack"
+region = "us-east-2"
+profile = "etl-demo"
+capabilities = "CAPABILITY_NAMED_IAM"
+confirm_changeset = true
+fail_on_empty_changeset = false
+resolve_s3 = true
+s3_prefix = "recipe-processing-stack"
+image_repositories = []
+parameter_overrides = "Environment=\"dev\""

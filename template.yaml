@@ -1,22 +1,218 @@
-Resources:
-  ExtractionLambda:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: lambdas/data_extraction/
-      Events:
-        RawBucketTrigger:
-          Type: S3
-          Properties:
-            Bucket: !Ref RawBucket
-            Events: s3:ObjectCreated:*
+AWSTemplateFormatVersion: "2010-09-09"
+Description: ETL Pipeline for Recipe Processing
+Transform: AWS::Serverless-2016-10-31
 
-  TransformationLambda:
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+
+Resources:
+  RawRecipesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # TODO: Make this dynamic using the environment variable
+      BucketName: !Sub "raw-recipes-data-${Environment}"
+      AccessControl: Private
+
+  TempRecipesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "temp-recipes-bucket-${Environment}"
+      AccessControl: Private
+
+  FailedRecipesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "failed-recipes-bucket-${Environment}"
+      AccessControl: Private
+
+  ProcessedRecipesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "processed-recipes-bucket-${Environment}"
+      AccessControl: Private
+
+  RecipeProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "recipe-processing-queue-${Environment}"
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 345600 # 4 days
+
+  DataExtractionLambda:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: lambdas/data_transformation/
+      FunctionName: !Sub "data-extraction-lambda-${Environment}"
+      Handler: data_extraction.lambda_handler
+      Runtime: python3.12
+      CodeUri: lambdas/data_extraction
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          TEMP_BUCKET: !Ref TempRecipesBucket
+          FAILED_BUCKET: !Ref FailedRecipesBucket
+          PROCESSING_QUEUE_URL: !GetAtt RecipeProcessingQueue.Arn
+          BATCH_SIZE: 100
+          MAX_WORKERS: 10
+      Timeout: 300
+      MemorySize: 512
+      ReservedConcurrentExecutions: 0
       Events:
-        TempBucketTrigger:
+        DataExtractionTrigger:
           Type: S3
           Properties:
-            Bucket: !Ref TempBucket
-            Events: s3:ObjectCreated:*
+            Bucket: !Ref RawRecipesBucket
+            Events:
+              - s3:ObjectCreated:*
+              - s3:ObjectRemoved:*
+
+  DataTransformationLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "data-transformation-lambda-${Environment}"
+      Handler: data_transformation.lambda_handler
+      Runtime: python3.12
+      CodeUri: lambdas/data_transformation
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          PROCESSED_BUCKET: !Ref ProcessedRecipesBucket
+      Timeout: 300
+      MemorySize: 512
+      ReservedConcurrentExecutions: 0
+      Events:
+        DataTransformationTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt RecipeProcessingQueue.Arn
+            BatchSize: 10
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GlueExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:*
+                  - iam:PassRole
+                Resource: "*"
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                  - sqs:*
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  RawBucketTrigger:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt DataExtractionLambda.Arn
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt RawRecipesBucket.Arn
+
+  QueueTrigger:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt DataTransformationLambda.Arn
+      Principal: sqs.amazonaws.com
+      SourceArn: !GetAtt RecipeProcessingQueue.Arn
+
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GlueCrawlerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ProcessedRecipesBucket.Arn
+                  - !Sub "${ProcessedRecipesBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  RecipeCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "recipe-data-crawler-${Environment}"
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: recipes_db
+      Description: "Crawler for processed recipe data"
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${ProcessedRecipesBucket}/"
+      TablePrefix: "processed_"
+      Schedule:
+        ScheduleExpression: "cron(0 0 * * ? *)" # Runs daily at midnight
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {
+              "AddOrUpdateBehavior": "InheritFromTable"
+            }
+          }
+        }
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "DEPRECATE_IN_DATABASE"
+      RecrawlPolicy:
+        RecrawlBehavior: "CRAWL_EVERYTHING"
+
+Outputs:
+  RawRecipesBucketName:
+    Description: Name of the raw recipes bucket
+    Value: !Ref RawRecipesBucket
+  ProcessedRecipesBucketName:
+    Description: Name of the processed recipes bucket
+    Value: !Ref ProcessedRecipesBucket
+  DataExtractionLambdaArn:
+    Description: ARN of the Data Extraction Lambda
+    Value: !GetAtt DataExtractionLambda.Arn
+  DataTransformationLambdaArn:
+    Description: ARN of the Data Transformation Lambda
+    Value: !GetAtt DataTransformationLambda.Arn
+  GlueCrawlerName:
+    Description: Name of the Glue Crawler
+    Value: !Ref RecipeCrawler
+  GlueDatabaseName:
+    Description: Name of the Glue Database
+    Value: recipes_db
+  SQSQueueUrl:
+    Description: URL of the processing queue
+    Value: !Ref RecipeProcessingQueue

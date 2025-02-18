@@ -111,7 +111,7 @@ def lambda_handler(event, context):
         ]
 
         # Save to processed storage
-        output_key = f"{datetime.now().strftime('%Y/%m/%d')}/{temp_key.split('/')[-1]}"
+        output_key = f"{df['difficulty_flag']}/{temp_key.split('/')[-1]}"
 
         # Save to processed storage
         s3.put_object(Bucket=PROCESSED_BUCKET, Key=output_key, Body=df.to_parquet())
