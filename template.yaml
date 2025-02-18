@@ -1,0 +1,22 @@
+Resources:
+  ExtractionLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/data_extraction/
+      Events:
+        RawBucketTrigger:
+          Type: S3
+          Properties:
+            Bucket: !Ref RawBucket
+            Events: s3:ObjectCreated:*
+
+  TransformationLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/data_transformation/
+      Events:
+        TempBucketTrigger:
+          Type: S3
+          Properties:
+            Bucket: !Ref TempBucket
+            Events: s3:ObjectCreated:*
