@@ -1,4 +1,4 @@
-# Building a Scalable Serverless AWS ETL Pipeline with Lambda, S3, and RDS PostgreSQL
+# A Hands-On Guide to Serverless ETL with AWS
 
 ## Overview
 
