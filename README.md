@@ -434,8 +434,6 @@ To enhance this pipeline, consider adding:
 5. Data versioning and lineage tracking
 6. Adding more complex data tools like AWS Glue, AWS Athena, AWS Redshift, etc.
 
-This completes our tutorial on building a serverless ETL pipeline using AWS Lambda, S3, and RDS PostgreSQL. You now have a basic but functional pipeline that can be extended to handle more complex data processing needs.
-
 ## Conclusion
 
 This post covered the basics of building a serverless ETL pipeline using AWS Lambda, S3, and RDS PostgreSQL. We walked through the process of creating the necessary IAM roles, S3 buckets, Lambda functions, and RDS PostgreSQL database. Although we faced some issues with the S3 Event Notifications that required us to create some workarounds, overall, this was a fun project to work on it shows us how we can simplyfy our life as software engineers by using existing tools and services in available in the AWS ecosystem in our favor to build scalable and efficient systems, with minor headaches in some of the integrations, but overall it was a great experience to be able to explore these resources.
