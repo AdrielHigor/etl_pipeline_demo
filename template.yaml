@@ -12,8 +12,8 @@ Parameters:
     Default: localhost
 
   RDSPostgreSQLPort:
-    Type: Number
-    Default: 5432
+    Type: String
+    Default: "5432"
 
   RDSPostgreSQLDBName:
     Type: String
@@ -36,30 +36,6 @@ Parameters:
     Default: recipes
 
 Resources:
-  RawRecipesBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub "raw-recipes-data-${Environment}"
-      AccessControl: Private
-
-  TempRecipesBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub "temp-recipes-bucket-${Environment}"
-      AccessControl: Private
-
-  FailedRecipesBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub "failed-recipes-bucket-${Environment}"
-      AccessControl: Private
-
-  ProcessedRecipesBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub "processed-recipes-bucket-${Environment}"
-      AccessControl: Private
-
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -85,19 +61,39 @@ Resources:
                   - logs:PutLogEvents
                 Resource: "*"
 
+  # First create the buckets
+  RawRecipesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "raw-recipes-data-${Environment}"
+      AccessControl: Private
 
+  TempRecipesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "temp-recipes-bucket-${Environment}"
+      AccessControl: Private
+
+  FailedRecipesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "failed-recipes-bucket-${Environment}"
+      AccessControl: Private
+
+  ProcessedRecipesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "processed-recipes-bucket-${Environment}"
+      AccessControl: Private
+
+  # Now we'll create Lambda functions one at a time, without events
   DataExtractionLambda:
     Type: AWS::Serverless::Function
-    DependsOn:
-      - LambdaExecutionRole
-      - RawRecipesBucket
-      - TempRecipesBucket
-      - FailedRecipesBucket
     Properties:
       FunctionName: !Sub "extraction-lambda-${Environment}"
       Handler: data_extraction.lambda_handler
-      Runtime: python3.12
-      CodeUri: lambdas/data_extraction
+      Runtime: python3.9
+      CodeUri: lambdas/data_extraction/
       Role: !GetAtt LambdaExecutionRole.Arn
       Environment:
         Variables:
@@ -106,11 +102,205 @@ Resources:
           FAILED_BUCKET: !Ref FailedRecipesBucket
       Timeout: 300
       MemorySize: 512
-      ReservedConcurrentExecutions: 0
-      Events:
-        DataExtractionTrigger:
-          Type: S3
-          Properties:
-            Bucket: !Ref RawRecipesBucket
-            Events:
-              - s3:ObjectCreated:*
+
+  DataTransformationLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "transformation-lambda-${Environment}"
+      Handler: data_transformation.lambda_handler
+      Runtime: python3.9
+      CodeUri: lambdas/data_transformation/
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          TEMP_BUCKET: !Ref TempRecipesBucket
+          PROCESSED_BUCKET: !Ref ProcessedRecipesBucket
+      Timeout: 300
+      MemorySize: 512
+
+  DataLoaderLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "loader-lambda-${Environment}"
+      Handler: data_loader.lambda_handler
+      Runtime: python3.9
+      CodeUri: lambdas/data_loader/
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          RDS_HOST: !Ref RDSPostgreSQLHost
+          RDS_PORT: !Ref RDSPostgreSQLPort
+          RDS_DB_NAME: !Ref RDSPostgreSQLDBName
+          RDS_USERNAME: !Ref RDSPostgreSQLUsername
+          RDS_PASSWORD: !Ref RDSPostgreSQLPassword
+          RDS_SCHEMA: !Ref RDSPostgreSQLSchema
+          RDS_TABLE: !Ref RDSPostgreSQLTable
+          PROCESSED_BUCKET: !Ref ProcessedRecipesBucket
+      Timeout: 300
+      MemorySize: 512
+
+  # Create permissions for S3 buckets to invoke Lambda functions
+  RawBucketPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DataExtractionLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt RawRecipesBucket.Arn
+
+  TempBucketPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DataTransformationLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt TempRecipesBucket.Arn
+
+  ProcessedBucketPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DataLoaderLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt ProcessedRecipesBucket.Arn
+
+  # Create notifications through CloudFormation native features
+  RawBucketConfiguration:
+    Type: Custom::S3BucketNotification
+    DependsOn: 
+      - RawBucketPermission
+      - DataExtractionLambda
+    Properties:
+      ServiceToken: !GetAtt NotificationFunction.Arn
+      BucketName: !Ref RawRecipesBucket
+      NotificationConfiguration:
+        LambdaFunctionConfigurations:
+          - Events: ["s3:ObjectCreated:*"]
+            LambdaFunctionArn: !GetAtt DataExtractionLambda.Arn
+
+  TempBucketConfiguration:
+    Type: Custom::S3BucketNotification
+    DependsOn: 
+      - TempBucketPermission
+      - DataTransformationLambda
+    Properties:
+      ServiceToken: !GetAtt NotificationFunction.Arn
+      BucketName: !Ref TempRecipesBucket
+      NotificationConfiguration:
+        LambdaFunctionConfigurations:
+          - Events: ["s3:ObjectCreated:*"]
+            LambdaFunctionArn: !GetAtt DataTransformationLambda.Arn
+
+  ProcessedBucketConfiguration:
+    Type: Custom::S3BucketNotification
+    DependsOn: 
+      - ProcessedBucketPermission
+      - DataLoaderLambda
+    Properties:
+      ServiceToken: !GetAtt NotificationFunction.Arn
+      BucketName: !Ref ProcessedRecipesBucket
+      NotificationConfiguration:
+        LambdaFunctionConfigurations:
+          - Events: ["s3:ObjectCreated:*"]
+            LambdaFunctionArn: !GetAtt DataLoaderLambda.Arn
+
+  # Lambda function to configure bucket notifications
+  NotificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: notification_handler.lambda_handler
+      Role: !GetAtt NotificationFunctionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      CodeUri: lambdas/notification_handler/
+  NotificationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3BucketNotificationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                  - s3:PutBucketNotificationConfiguration
+                Resource: '*'
+
+  # RDS PostgreSQL resources
+  RDSPostgreSQL:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "rds-postgresql-${Environment}"
+      Engine: postgres
+      EngineVersion: "16.8"
+      DBParameterGroupName: !Ref RDSPostgreSQLParameterGroup
+      DBInstanceClass: db.t3.micro
+      DBName: !Ref RDSPostgreSQLDBName
+      MasterUsername: !Ref RDSPostgreSQLUsername
+      MasterUserPassword: !Ref RDSPostgreSQLPassword
+      AllocatedStorage: 20
+      StorageType: gp2
+      StorageEncrypted: true
+      MaxAllocatedStorage: 20
+      PubliclyAccessible: true
+      DeletionProtection: false
+
+  RDSPostgreSQLParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub "rds-postgresql-parameter-group-${Environment}"
+      Family: postgres16
+      Description: Parameter group for RDS PostgreSQL
+      Parameters:
+        max_connections: 100
+        shared_preload_libraries: pg_cron
+        cron.database_name: postgres
+
+Outputs:
+  RawRecipesBucketName:
+    Description: Name of the raw recipes bucket
+    Value: !Ref RawRecipesBucket
+  
+  TempRecipesBucketName:
+    Description: Name of the temp recipes bucket
+    Value: !Ref TempRecipesBucket
+  
+  FailedRecipesBucketName:
+    Description: Name of the failed recipes bucket
+    Value: !Ref FailedRecipesBucket
+  
+  ProcessedRecipesBucketName:
+    Description: Name of the processed recipes bucket
+    Value: !Ref ProcessedRecipesBucket
+  
+  DataExtractionLambdaArn:
+    Description: ARN of the Data Extraction Lambda
+    Value: !GetAtt DataExtractionLambda.Arn
+  
+  DataTransformationLambdaArn:
+    Description: ARN of the Data Transformation Lambda
+    Value: !GetAtt DataTransformationLambda.Arn
+  
+  DataLoaderLambdaArn:
+    Description: ARN of the Data Loader Lambda
+    Value: !GetAtt DataLoaderLambda.Arn
+    
+  RDSPostgreSQLEndpoint:
+    Description: Endpoint of the RDS PostgreSQL instance
+    Value: !GetAtt RDSPostgreSQL.Endpoint.Address
+    
+  RDSPostgreSQLPort:
+    Description: Port of the RDS PostgreSQL instance
+    Value: !GetAtt RDSPostgreSQL.Endpoint.Port
+    
